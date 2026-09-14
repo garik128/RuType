@@ -18,6 +18,75 @@ public sealed class AppConfig
     public LearningCfg Learning { get; set; } = new();
     public UiCfg Ui { get; set; } = new();
 
+    /// <summary>
+    /// Привести загруженный конфиг к допустимому виду: секции, заданные в JSON как
+    /// null, заменяются дефолтами (иначе NullReferenceException в потоке хука), числа
+    /// зажимаются в разумные диапазоны, пустые пути возвращаются к дефолтным.
+    /// Корректные значения не меняются.
+    /// </summary>
+    public void Normalize()
+    {
+        var d = new AppConfig();
+        General ??= d.General;
+        Typo ??= d.Typo;
+        Layout ??= d.Layout;
+        Sound ??= d.Sound;
+        Tray ??= d.Tray;
+        Suggestions ??= d.Suggestions;
+        Exclusions ??= d.Exclusions;
+        Dictionaries ??= d.Dictionaries;
+        Ngram ??= d.Ngram;
+        Learning ??= d.Learning;
+        Ui ??= d.Ui;
+
+        General.Theme = Str(General.Theme, d.General.Theme);
+        General.Language = Str(General.Language, d.General.Language);
+
+        Typo.MaxEditDistance = Math.Clamp(Typo.MaxEditDistance, 1, 2);
+        Typo.MinWordLength = Math.Clamp(Typo.MinWordLength, 1, 50);
+        Typo.DominanceRatio = Num(Typo.DominanceRatio, 1, 1e6, d.Typo.DominanceRatio);
+        Typo.MinFrequency = Math.Max(0, Typo.MinFrequency);
+        Typo.NgramWeight = Num(Typo.NgramWeight, 0, 100, d.Typo.NgramWeight);
+        Typo.FreqWeight = Num(Typo.FreqWeight, 0, 100, d.Typo.FreqWeight);
+        Typo.ScoreGap = Num(Typo.ScoreGap, 0, 100, d.Typo.ScoreGap);
+
+        Layout.Aggressiveness = Str(Layout.Aggressiveness, d.Layout.Aggressiveness);
+        Layout.MinWordLength = Math.Clamp(Layout.MinWordLength, 1, 50);
+        Layout.FixTypoMinLength = Math.Clamp(Layout.FixTypoMinLength, 1, 50);
+        Layout.HotkeyUndoVk = Math.Clamp(Layout.HotkeyUndoVk, 0, 255);
+        Layout.HotkeySuggestVk = Math.Clamp(Layout.HotkeySuggestVk, 0, 255);
+
+        Sound.TypoWav = Str(Sound.TypoWav, d.Sound.TypoWav);
+        Sound.LayoutWav = Str(Sound.LayoutWav, d.Sound.LayoutWav);
+
+        Tray.BlinkMs = Math.Clamp(Tray.BlinkMs, 0, 10000);
+        Tray.IconIdle = Str(Tray.IconIdle, d.Tray.IconIdle);
+        Tray.IconActive = Str(Tray.IconActive, d.Tray.IconActive);
+
+        Suggestions.Threshold = Math.Clamp(Suggestions.Threshold, 1, 1000);
+
+        Exclusions.AppBlacklist ??= new();
+        Exclusions.AppBlacklist.RemoveAll(s => s == null);
+
+        Dictionaries.RuHunspell = Str(Dictionaries.RuHunspell, d.Dictionaries.RuHunspell);
+        Dictionaries.EnHunspell = Str(Dictionaries.EnHunspell, d.Dictionaries.EnHunspell);
+        Dictionaries.RuFreq = Str(Dictionaries.RuFreq, d.Dictionaries.RuFreq);
+        Dictionaries.RuExtra = Str(Dictionaries.RuExtra, d.Dictionaries.RuExtra);
+        Dictionaries.RuExtraDic = Str(Dictionaries.RuExtraDic, d.Dictionaries.RuExtraDic);
+        Dictionaries.EnExtra = Str(Dictionaries.EnExtra, d.Dictionaries.EnExtra);
+
+        Ngram.CacheFile = Str(Ngram.CacheFile, d.Ngram.CacheFile);
+        Learning.File = Str(Learning.File, d.Learning.File);
+
+        Ui.SettingsWidth = Num(Ui.SettingsWidth, 300, 20000, d.Ui.SettingsWidth);
+        Ui.SettingsHeight = Num(Ui.SettingsHeight, 300, 20000, d.Ui.SettingsHeight);
+    }
+
+    private static string Str(string? v, string def) => string.IsNullOrWhiteSpace(v) ? def : v;
+
+    private static double Num(double v, double min, double max, double def)
+        => double.IsFinite(v) ? Math.Clamp(v, min, max) : def;
+
     public sealed class UiCfg
     {
         // Размер окна настроек (запоминается при закрытии).
@@ -125,7 +194,8 @@ public sealed class AppConfig
     {
         // Копить локальный лог правок/откатов (data/corrections.jsonl) для анализа
         // качества и настройки порогов. Приватно, только события правок, не keylog.
-        public bool Enabled { get; set; } = true;
+        // Opt-in: по умолчанию выключено, включается пользователем в настройках.
+        public bool Enabled { get; set; } = false;
         public string File { get; set; } = "corrections.jsonl";
     }
 

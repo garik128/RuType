@@ -18,9 +18,9 @@ public sealed class Dictionaries
     private WordList? _ruHun;
     private WordList? _enHun;
     private WordList? _ruExtraHun;
-    private NgramModel? _ngram;
+    private volatile NgramModel? _ngram;
 
-    /// <summary>Подключить триграммную модель для ранжирования кандидатов.</summary>
+    /// <summary>Подключить триграммную модель для ранжирования кандидатов (с любого потока).</summary>
     public void SetNgram(NgramModel? ngram) => _ngram = ngram;
     public bool NgramLoaded => _ngram is { Loaded: true };
 
@@ -29,11 +29,13 @@ public sealed class Dictionaries
     // там, где Hunspell.Suggest не предлагает очевидное частотное слово.
     private readonly Dictionary<string, List<string>> _freqPrefix = new(StringComparer.Ordinal);
     private bool _freqIndexBuilt;
-    private readonly HashSet<string> _myWords = new(StringComparer.Ordinal);
-    private readonly HashSet<string> _stopWords = new(StringComparer.Ordinal);
+    // Пользовательские списки перечитываются из UI-потока, а читаются потоком хука:
+    // коллекции не правятся на месте, а собираются заново и подменяются ссылкой.
+    private volatile HashSet<string> _myWords = new(StringComparer.Ordinal);
+    private volatile HashSet<string> _stopWords = new(StringComparer.Ordinal);
     private readonly HashSet<string> _extraWords = new(StringComparer.Ordinal);
     private readonly HashSet<string> _enExtraWords = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _rules = new(StringComparer.Ordinal);
+    private volatile Dictionary<string, string> _rules = new(StringComparer.Ordinal);
 
     public bool RuLoaded => _ruHun != null;
     public bool EnLoaded => _enHun != null;
@@ -324,27 +326,28 @@ public sealed class Dictionaries
 
     public void LoadUserLists(string myWordsPath, string stopWordsPath, string rulesPath)
     {
-        LoadWordSet(myWordsPath, _myWords);
-        LoadWordSet(stopWordsPath, _stopWords);
-        LoadRules(rulesPath, _rules);
+        _myWords = LoadWordSet(myWordsPath);
+        _stopWords = LoadWordSet(stopWordsPath);
+        _rules = LoadRules(rulesPath);
     }
 
-    private static void LoadWordSet(string path, HashSet<string> target)
+    private static HashSet<string> LoadWordSet(string path)
     {
-        target.Clear();
-        if (!File.Exists(path)) return;
+        var target = new HashSet<string>(StringComparer.Ordinal);
+        if (!File.Exists(path)) return target;
         foreach (var raw in File.ReadLines(path))
         {
             var line = raw.Trim();
             if (line.Length == 0 || line.StartsWith('#')) continue;
             target.Add(line.ToLowerInvariant());
         }
+        return target;
     }
 
-    private static void LoadRules(string path, Dictionary<string, string> target)
+    private static Dictionary<string, string> LoadRules(string path)
     {
-        target.Clear();
-        if (!File.Exists(path)) return;
+        var target = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!File.Exists(path)) return target;
         foreach (var raw in File.ReadLines(path))
         {
             var line = raw.Trim();
@@ -356,5 +359,6 @@ public sealed class Dictionaries
             if (from.Length == 0 || to.Length == 0) continue;
             target[from] = to;
         }
+        return target;
     }
 }

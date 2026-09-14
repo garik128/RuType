@@ -137,7 +137,10 @@ public partial class App : Application
 
         _store = new ConfigStore();
         _cfg = _store.Load();
-        _store.Save(_cfg);            // дозаписать новые поля в config.json (миграция схемы)
+        string? configProblem = _store.LoadProblem;
+        // Дозаписать новые поля в config.json (миграция схемы). Если файл не прочитался,
+        // НЕ пересохраняем: дефолты молча затёрли бы настройки пользователя.
+        if (configProblem == null) _store.Save(_cfg);
         _store.EnsureUserLists();
 
         _dict = new Dictionaries();
@@ -162,6 +165,7 @@ public partial class App : Application
                 System.IO.Path.Combine(_store.DataDir, _cfg.Ngram.CacheFile),
                 _cfg.Ngram.WeightByFrequency);
             _dict.SetNgram(ngram);
+            _ngramWeighted = _cfg.Ngram.WeightByFrequency;
             Core.Log.Line($"ngram: {(ngram.Loaded ? $"загружена ({ngram.TrigramCount} триграмм, freq={_cfg.Ngram.WeightByFrequency})" : "НЕ построена")}");
         }
         _dict.PrewarmIndexes(); // индекс частот - на старте, не в потоке хука
@@ -171,12 +175,18 @@ public partial class App : Application
 
         _exclusions = new ExclusionManager();
         _exclusions.SetBlacklist(_cfg.Exclusions.AppBlacklist);
+        if (_cfg.Exclusions.SkipPasswordFields) _exclusions.StartFocusTracking();
 
-        _analyzer = new Analyzer(_dict, _cfg)
+        StartHookThread();
+
+        // Поток хука читает только собственный снимок настроек: SettingsWindow правит
+        // _cfg на UI-потоке поле за полем, и анализ посреди такой правки видел бы
+        // полуобновлённый конфиг. Новый снимок передаётся в ApplySettings.
+        _analyzer = new Analyzer(_dict, ConfigStore.Clone(_cfg))
         {
             LayoutDetectionEnabled = _cfg.Layout.Enabled && _layout.BothPresent && enOk
         };
-        _processor = new InputProcessor(_analyzer, Dispatcher, _exclusions, _cfg.Exclusions.SkipPasswordFields)
+        _processor = new InputProcessor(_analyzer, _hookDispatcher, _exclusions, _cfg.Exclusions.SkipPasswordFields)
         {
             Enabled = _cfg.General.Enabled,
             HotkeyVk = _cfg.Layout.HotkeyUndoVk,
@@ -184,6 +194,8 @@ public partial class App : Application
             RuLayout = _layout.RuLayout,
             EnLayout = _layout.EnLayout
         };
+        // Обработчики ниже вызываются на потоке хука. Инъекция остаётся там же (сразу
+        // после возврата из обработчика хука), всё остальное уходит в UI-поток.
         _processor.ReplacementRequested += OnReplacement;
         _processor.ToggleRequested += OnToggle;
         _processor.SuggestRequested += word => Dispatcher.BeginInvoke(() => ShowSuggestion(word));
@@ -195,7 +207,9 @@ public partial class App : Application
         };
         _learn = new LearnLog(
             System.IO.Path.Combine(_store.DataDir, _cfg.Learning.File), _cfg.Learning.Enabled);
-        _processor.WordRejected += OnWordRejected;
+        // WordRejected приходит синхронно из обработчика хука: запись лога и счётчик
+        // окна слова - на UI-потоке, не в хуке.
+        _processor.WordRejected += word => Dispatcher.BeginInvoke(() => OnWordRejected(word));
 
         _sounds = new Sounds(
             _store.ResolveAppPath(_cfg.Sound.TypoWav),
@@ -213,26 +227,28 @@ public partial class App : Application
         AutostartManager.Apply(_cfg.General.Autostart); // синхронизировать реестр с конфигом
 
         _mouseHook = new MouseHook();
-        _mouseHook.ButtonDown += _processor.ResetWordState; // клик мышью двигает каретку
-        _mouseHook.Install();
-
+        _mouseHook.ButtonDown += () =>
+        {
+            _processor.ResetWordState();         // клик мышью двигает каретку
+            _exclusions.InvalidateFocusCache();  // и может сменить поле ввода
+        };
         _hook = new KeyboardHook();
         _hook.KeyAction += _processor.OnKey;
-        try
-        {
-            _hook.Install();
-            StartHookWatchdog();
-            Core.Log.Line($"hook installed={_hook.IsInstalled}, enabled={_processor.Enabled}, ruOk={ruOk}, enOk={enOk}, freqOk={freqOk} ({_dict.FreqCount}), " +
-                          $"extraDic={extraDicOk}, enExtra={enExtraOk} ({_dict.EnExtraWordsCount}), " +
-                          $"layoutDetect={_analyzer.LayoutDetectionEnabled} (ru={_layout.RuLayout:X} en={_layout.EnLayout:X}), " +
-                          $"my={_dict.MyWordsCount}/stop={_dict.StopWordsCount}/rules={_dict.RulesCount}");
-        }
-        catch (Exception ex)
-        {
-            Core.Log.Line($"hook install FAILED: {ex}");
-            MessageBox.Show($"Не удалось установить хук клавиатуры:\n{ex.Message}", "RuType",
-                MessageBoxButton.OK, MessageBoxImage.Error);
-        }
+
+        // Хуки ставятся и обслуживаются на своём потоке: их обработчики выполняются в
+        // цикле сообщений того потока, который их установил.
+        var hookErrors = (string?)null;
+        _hookDispatcher.Invoke(() => hookErrors = InstallHooks());
+        Core.Log.Line($"hook installed={_hook.IsInstalled}, mouse={_mouseHook.IsInstalled}, enabled={_processor.Enabled}, ruOk={ruOk}, enOk={enOk}, freqOk={freqOk} ({_dict.FreqCount}), " +
+                      $"extraDic={extraDicOk}, enExtra={enExtraOk} ({_dict.EnExtraWordsCount}), " +
+                      $"layoutDetect={_analyzer.LayoutDetectionEnabled} (ru={_layout.RuLayout:X} en={_layout.EnLayout:X}), " +
+                      $"my={_dict.MyWordsCount}/stop={_dict.StopWordsCount}/rules={_dict.RulesCount}, " +
+                      $"integrity=0x{ExclusionManager.OwnIntegrityLevel:X}");
+        if (hookErrors != null)
+            MessageBox.Show(hookErrors, "RuType", MessageBoxButton.OK, MessageBoxImage.Error);
+
+        if (configProblem != null)
+            MessageBox.Show(configProblem, "RuType", MessageBoxButton.OK, MessageBoxImage.Warning);
 
         if (!ruOk)
         {
@@ -242,40 +258,112 @@ public partial class App : Application
         }
     }
 
+    // --- поток хуков ---
+
+    // Клавиатурный и мышиный LL-хуки живут на отдельном потоке со своим циклом
+    // сообщений, а не на UI-потоке. Обработчик LL-хука выполняется в потоке, который
+    // его установил; пока тот поток занят (открытие окна настроек, пересборка модели,
+    // модальное окно), ввод тормозит во всей системе, а после LowLevelHooksTimeout
+    // Windows молча снимает хук. На отдельном потоке UI-заминки хук не задевают.
+    private Thread? _hookThread;
+    private Dispatcher _hookDispatcher = null!;
+
+    private void StartHookThread()
+    {
+        using var ready = new ManualResetEventSlim();
+        _hookThread = new Thread(() =>
+        {
+            _hookDispatcher = Dispatcher.CurrentDispatcher;
+            _hookDispatcher.UnhandledException += (_, e) =>
+            {
+                // Исключение в обработчике не должно убивать поток хуков (и весь процесс).
+                Core.Log.Line($"hook thread exception: {e.Exception}");
+                e.Handled = true;
+            };
+            ready.Set();
+            Dispatcher.Run();
+        })
+        {
+            IsBackground = true,
+            Name = "RuType hooks",
+            Priority = ThreadPriority.AboveNormal
+        };
+        _hookThread.SetApartmentState(ApartmentState.STA);
+        _hookThread.Start();
+        ready.Wait();
+    }
+
+    /// <summary>Поставить оба хука и watchdog. Выполняется на потоке хуков. Возвращает текст ошибки или null.</summary>
+    private string? InstallHooks()
+    {
+        var errors = new List<string>();
+        try
+        {
+            _mouseHook.Install();
+        }
+        catch (Exception ex)
+        {
+            // Без хука мыши клик не сбрасывает набор; watchdog будет пытаться поставить его снова.
+            Core.Log.Line($"mouse hook install FAILED: {ex}");
+            errors.Add($"Не удалось установить хук мыши:\n{ex.Message}\n\nПосле перемещения каретки мышью правка может попасть не туда. Программа будет пытаться установить хук повторно.");
+        }
+        try
+        {
+            _hook.Install();
+        }
+        catch (Exception ex)
+        {
+            Core.Log.Line($"hook install FAILED: {ex}");
+            errors.Add($"Не удалось установить хук клавиатуры:\n{ex.Message}");
+        }
+        StartHookWatchdog();
+        return errors.Count > 0 ? string.Join("\n\n", errors) : null;
+    }
+
     // Windows 7+ молча снимает LL-хук, чей обработчик однажды превысил
     // LowLevelHooksTimeout (300 мс по умолчанию; Hunspell.Suggest на слабой машине
     // может). Снаружи это выглядит как "программа перестала работать до перезапуска".
     // Периодическая переустановка возвращает хук; сама операция мгновенна и ввод не теряет.
+    // Переустанавливаются ОБА хука: мышиный снимается по той же причине, и без него
+    // клик перестаёт сбрасывать набор. Таймер - на потоке хуков (переустановка
+    // должна идти из того же потока, что и установка).
     private DispatcherTimer? _hookWatchdog;
 
     private void StartHookWatchdog()
     {
-        _hookWatchdog = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
-        _hookWatchdog.Tick += (_, _) =>
+        _hookWatchdog = new DispatcherTimer(TimeSpan.FromSeconds(30), DispatcherPriority.Normal, (_, _) =>
         {
-            try
-            {
-                long slow = _hook.TakeMaxCallbackMs();
-                if (slow >= 200) Core.Log.Line($"watchdog: самый долгий обработчик за период {slow} мс");
-                _hook.Reinstall();
-            }
-            catch (Exception ex) { Core.Log.Line($"watchdog: переустановка хука не удалась: {ex.Message}"); }
-        };
-        _hookWatchdog.Start();
+            long slow = _hook.TakeMaxCallbackMs();
+            if (slow >= 200) Core.Log.Line($"watchdog: самый долгий обработчик за период {slow} мс");
+            try { _hook.Reinstall(); }
+            catch (Exception ex) { Core.Log.Line($"watchdog: переустановка хука клавиатуры не удалась: {ex.Message}"); }
+            try { _mouseHook.Reinstall(); }
+            catch (Exception ex) { Core.Log.Line($"watchdog: переустановка хука мыши не удалась: {ex.Message}"); }
+        }, _hookDispatcher);
     }
 
     private void OnEnabledChanged(bool enabled)
     {
-        _processor.Enabled = enabled;
+        _hookDispatcher.BeginInvoke(() => _processor.Enabled = enabled);
         _cfg.General.Enabled = enabled;
         _store.Save(_cfg);
         _tray.SetEnabledChecked(enabled);
     }
 
+    // Выполняется на потоке хуков. Окно сменилось между решением и инъекцией -
+    // backspace стёрли бы чужой текст, поэтому замену отменяем.
+    private bool TargetWindowChanged(IntPtr window)
+    {
+        if (window == IntPtr.Zero || NativeMethods.GetForegroundWindow() == window) return false;
+        Core.Log.Line("инъекция отменена: активное окно сменилось");
+        _processor.ResetWordState();
+        return true;
+    }
+
     private void OnReplacement(ReplacementRequest req)
     {
         Core.Log.Line($"REPLACE backspaces={req.Backspaces} text='{req.Text}' kind={req.Kind} layout={req.Layout}");
-        _learn.LogCorrection(req.Original, req.Corrected, req.Kind);
+        if (TargetWindowChanged(req.Window)) return;
 
         // Для смены раскладки сначала переключаем язык ввода окна, затем перенабираем.
         if (req.Kind == ActionKind.Layout)
@@ -284,19 +372,29 @@ public partial class App : Application
             _layout.Activate(hkl);
         }
 
-        Replacer.Replace(req.Backspaces, req.Text, req.TrailingVk);
-
-        if (_cfg.Tray.BlinkOnAction)
-            _tray.Blink();
-
-        if (req.Kind == ActionKind.Layout)
+        if (!Replacer.Replace(req.Backspaces, req.Text, req.TrailingVk))
         {
-            if (_cfg.Sound.BeepOnLayout) _sounds.PlayLayout();
+            // Система не приняла ввод: текст на экране не соответствует нашему состоянию.
+            _processor.ResetWordState();
+            return;
         }
-        else if (_cfg.Sound.BeepOnTypo && (req.Kind == ActionKind.Typo || req.Kind == ActionKind.Rule))
+
+        Dispatcher.BeginInvoke(() =>
         {
-            _sounds.PlayTypo();
-        }
+            _learn.LogCorrection(req.Original, req.Corrected, req.Kind);
+
+            if (_cfg.Tray.BlinkOnAction)
+                _tray.Blink();
+
+            if (req.Kind == ActionKind.Layout)
+            {
+                if (_cfg.Sound.BeepOnLayout) _sounds.PlayLayout();
+            }
+            else if (_cfg.Sound.BeepOnTypo && (req.Kind == ActionKind.Typo || req.Kind == ActionKind.Rule))
+            {
+                _sounds.PlayTypo();
+            }
+        });
     }
 
     private SettingsWindow? _settingsWindow;
@@ -311,33 +409,35 @@ public partial class App : Application
 
     private void ApplySettings()
     {
-        // Файлы списков могли измениться - перечитать.
+        var snapshot = ConfigStore.Clone(_cfg); // _cfg уже нормализован в ConfigStore.Save
+
+        // Файлы списков могли измениться - перечитать (коллекции подменяются ссылкой,
+        // поток хука видит либо старый, либо новый набор целиком).
         _dict.LoadUserLists(_store.MyWordsPath, _store.StopWordsPath, _store.RulesPath);
 
-        _analyzer.UpdateConfig(_cfg);
-        _layout.Detect(); // раскладку могли добавить в систему уже после запуска
-        _processor.RuLayout = _layout.RuLayout;
-        _processor.EnLayout = _layout.EnLayout;
-        _analyzer.LayoutDetectionEnabled = _cfg.Layout.Enabled && _layout.BothPresent && _dict.EnLoaded;
+        _layout.Detect(); // раскладку могли добавить или удалить уже после запуска
+        IntPtr ru = _layout.RuLayout, en = _layout.EnLayout;
+        bool layoutDetect = snapshot.Layout.Enabled && ru != IntPtr.Zero && en != IntPtr.Zero && _dict.EnLoaded;
 
-        // Режим обучения n-gram мог измениться - пересобрать модель (при смене режима
-        // кеш недействителен и строится заново; иначе грузится из кеша мгновенно).
-        if (_dict.RuLoaded)
+        _exclusions.SetBlacklist(snapshot.Exclusions.AppBlacklist);
+        if (snapshot.Exclusions.SkipPasswordFields) _exclusions.StartFocusTracking();
+
+        // Состояние анализатора и процессора меняется только на потоке хуков.
+        _hookDispatcher.BeginInvoke(() =>
         {
-            var ngram = NgramModel.BuildOrLoad(
-                _store.ResolveAppPath(_cfg.Dictionaries.RuHunspell),
-                _store.ResolveAppPath(_cfg.Dictionaries.RuFreq),
-                System.IO.Path.Combine(_store.DataDir, _cfg.Ngram.CacheFile),
-                _cfg.Ngram.WeightByFrequency);
-            _dict.SetNgram(ngram);
-        }
+            _analyzer.UpdateConfig(snapshot);
+            _analyzer.LayoutDetectionEnabled = layoutDetect;
+            _processor.RuLayout = ru;
+            _processor.EnLayout = en;
+            _processor.Enabled = snapshot.General.Enabled;
+            _processor.SkipPasswordFields = snapshot.Exclusions.SkipPasswordFields;
+            _processor.HotkeyVk = snapshot.Layout.HotkeyUndoVk;
+            _processor.SuggestHotkeyVk = snapshot.Layout.HotkeySuggestVk;
+            _processor.RefreshExclusions(); // чёрный список мог измениться - пересчитать для активного окна
+        });
 
-        _processor.Enabled = _cfg.General.Enabled;
-        _processor.SkipPasswordFields = _cfg.Exclusions.SkipPasswordFields;
-        _processor.HotkeyVk = _cfg.Layout.HotkeyUndoVk;
-        _processor.SuggestHotkeyVk = _cfg.Layout.HotkeySuggestVk;
+        RebuildNgramIfNeeded(snapshot);
 
-        _exclusions.SetBlacklist(_cfg.Exclusions.AppBlacklist);
         _suggestions.Enabled = _cfg.Suggestions.Enabled;
         _suggestions.Threshold = _cfg.Suggestions.Threshold;
         _learn.Enabled = _cfg.Learning.Enabled;
@@ -401,9 +501,11 @@ public partial class App : Application
         Core.Log.Line($"suggestion '{word}' -> {choice}");
     }
 
+    // Выполняется на потоке хуков (как и OnReplacement).
     private void OnToggle(ToggleRequest t)
     {
         Core.Log.Line($"TOGGLE backspaces={t.Backspaces} text='{t.Text}' activate={t.ActivateLayout}");
+        if (TargetWindowChanged(t.Window)) return;
 
         if (t.ActivateLayout != LayoutTarget.None)
         {
@@ -411,20 +513,83 @@ public partial class App : Application
             _layout.Activate(hkl);
         }
 
-        Replacer.Replace(t.Backspaces, t.Text, t.TrailingVk);
+        if (!Replacer.Replace(t.Backspaces, t.Text, t.TrailingVk))
+        {
+            _processor.ResetWordState();
+            return;
+        }
 
-        if (_cfg.Tray.BlinkOnAction)
-            _tray.Blink();
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (_cfg.Tray.BlinkOnAction)
+                _tray.Blink();
+        });
+    }
+
+    // Режим обучения n-gram, под который построена текущая модель, и поколение сборки.
+    private bool _ngramWeighted;
+    private int _ngramGeneration;
+    private readonly object _ngramBuildLock = new();
+
+    /// <summary>
+    /// Пересобрать n-gram, если в настройках сменился режим обучения. Сборка по 300k
+    /// словам занимает секунды - она идёт в фоне, пока работает прежняя модель; готовая
+    /// подменяется ссылкой. Раньше сборка шла прямо в UI-потоке, на котором висел хук.
+    /// Сборки последовательны (общий файл кеша), устаревшее поколение не применяется.
+    /// </summary>
+    private void RebuildNgramIfNeeded(AppConfig snapshot)
+    {
+        if (!_dict.RuLoaded || snapshot.Ngram.WeightByFrequency == _ngramWeighted) return;
+        _ngramWeighted = snapshot.Ngram.WeightByFrequency;
+
+        int generation = Interlocked.Increment(ref _ngramGeneration);
+        string dic = _store.ResolveAppPath(snapshot.Dictionaries.RuHunspell);
+        string freq = _store.ResolveAppPath(snapshot.Dictionaries.RuFreq);
+        string cache = System.IO.Path.Combine(_store.DataDir, snapshot.Ngram.CacheFile);
+        bool weighted = snapshot.Ngram.WeightByFrequency;
+
+        Task.Run(() =>
+        {
+            try
+            {
+                lock (_ngramBuildLock)
+                {
+                    if (generation != Volatile.Read(ref _ngramGeneration)) return;
+                    var ngram = NgramModel.BuildOrLoad(dic, freq, cache, weighted);
+                    if (generation != Volatile.Read(ref _ngramGeneration)) return;
+                    _dict.SetNgram(ngram);
+                    Core.Log.Line($"ngram: пересобрана в фоне (freq={weighted}, загружена={ngram.Loaded})");
+                }
+            }
+            catch (Exception ex)
+            {
+                Core.Log.Line($"ngram: пересборка не удалась: {ex}");
+            }
+        });
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
-        _hookWatchdog?.Stop();
-        _hook?.Dispose();
-        _mouseHook?.Dispose();
+        if (_hookThread != null)
+        {
+            try
+            {
+                // Снять хуки из того же потока, что их ставил; не ждать дольше секунды.
+                _hookDispatcher.Invoke(() =>
+                {
+                    _hookWatchdog?.Stop();
+                    _hook?.Dispose();
+                    _mouseHook?.Dispose();
+                }, DispatcherPriority.Send, CancellationToken.None, TimeSpan.FromSeconds(1));
+                _hookDispatcher.InvokeShutdown();
+            }
+            catch (Exception ex) { Core.Log.Line($"exit: остановка потока хуков: {ex.Message}"); }
+        }
+        _exclusions?.Dispose();
         _tray?.Dispose();
         _sounds?.Dispose();
         _singleInstance?.Dispose();
+        Core.Log.Flush();
         base.OnExit(e);
     }
 }

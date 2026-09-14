@@ -195,6 +195,33 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetShellWindow();
+
+    // --- Уровень целостности процесса (UIPI) ---
+
+    public const uint TOKEN_QUERY = 0x0008;
+    public const int TokenIntegrityLevel = 25;
+    public const uint SECURITY_MANDATORY_MEDIUM_RID = 0x2000;
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass,
+        IntPtr tokenInformation, int tokenInformationLength, out int returnLength);
+
+    [DllImport("advapi32.dll")]
+    public static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+
+    [DllImport("advapi32.dll")]
+    public static extern IntPtr GetSidSubAuthority(IntPtr sid, uint subAuthority);
+
     // --- Позиция курсора (для всплывающего окна) ---
 
     [StructLayout(LayoutKind.Sequential)]

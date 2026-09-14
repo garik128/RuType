@@ -1,16 +1,24 @@
+using System.Collections.Concurrent;
 using System.IO;
+using System.Text;
 
 namespace RuType.Core;
 
 /// <summary>
 /// Лёгкий диагностический лог. Включается, если в каталоге данных есть файл
-/// debug.on. Пишет в %TEMP%\rutype_debug.log. В обычной работе бездействует.
+/// debug.on. Пишет в data\rutype_debug.log. В обычной работе бездействует.
+///
+/// Запись асинхронная: Line только кладёт строку в очередь, файл пишет фоновый
+/// поток пачками. Лог зовётся из обработчика LL-хука, а синхронная дозапись файла
+/// на каждое событие удлиняла бы обработчик (риск снятия хука по таймауту).
 /// </summary>
 public static class Log
 {
     private static readonly bool _enabled;
     private static readonly string _path;
-    private static readonly object _lock = new();
+    private static readonly ConcurrentQueue<string> _queue = new();
+    private static readonly AutoResetEvent _signal = new(false);
+    private static readonly object _writeLock = new();
 
     static Log()
     {
@@ -20,8 +28,8 @@ public static class Log
         _enabled = File.Exists(Path.Combine(dataDir, "debug.on"));
         if (_enabled)
         {
-            try { File.AppendAllText(_path, $"\n=== старт {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n"); }
-            catch { }
+            _queue.Enqueue($"\n=== старт {DateTime.Now:yyyy-MM-dd HH:mm:ss} ===\n");
+            new Thread(WriterLoop) { IsBackground = true, Name = "RuType log" }.Start();
         }
     }
 
@@ -30,11 +38,34 @@ public static class Log
     public static void Line(string s)
     {
         if (!_enabled) return;
-        try
+        _queue.Enqueue($"{DateTime.Now:HH:mm:ss.fff} {s}\n");
+        _signal.Set();
+    }
+
+    /// <summary>Дописать накопленное синхронно (при выходе из программы).</summary>
+    public static void Flush()
+    {
+        if (_enabled) Drain();
+    }
+
+    private static void WriterLoop()
+    {
+        while (true)
         {
-            lock (_lock)
-                File.AppendAllText(_path, $"{DateTime.Now:HH:mm:ss.fff} {s}\n");
+            _signal.WaitOne(1000);
+            Drain();
         }
-        catch { }
+    }
+
+    private static void Drain()
+    {
+        lock (_writeLock)
+        {
+            if (_queue.IsEmpty) return;
+            var sb = new StringBuilder();
+            while (_queue.TryDequeue(out var line)) sb.Append(line);
+            try { File.AppendAllText(_path, sb.ToString()); }
+            catch { }
+        }
     }
 }

@@ -18,8 +18,11 @@ public static class Replacer
     /// Стирает <paramref name="backspaces"/> символов, печатает <paramref name="text"/>
     /// и, если задан <paramref name="trailingVk"/>, дожимает эту клавишу (Enter/Tab)
     /// как обычное нажатие (Unicode-инъекция переводов строки/табов ненадёжна).
+    /// Возвращает false, если система вставила не все события: SendInput ограничен
+    /// UIPI (в окно процесса с более высоким уровнем целостности ввод не проходит)
+    /// и возвращает число реально вставленных событий.
     /// </summary>
-    public static void Replace(int backspaces, string text, int trailingVk = 0)
+    public static bool Replace(int backspaces, string text, int trailingVk = 0)
     {
         var inputs = new List<INPUT>(backspaces * 2 + text.Length * 2 + 2);
 
@@ -41,9 +44,14 @@ public static class Replacer
             inputs.Add(KeyUpVk((ushort)trailingVk));
         }
 
-        if (inputs.Count == 0) return;
+        if (inputs.Count == 0) return true;
         var arr = inputs.ToArray();
-        SendInput((uint)arr.Length, arr, CbSize);
+        uint sent = SendInput((uint)arr.Length, arr, CbSize);
+        if (sent == arr.Length) return true;
+
+        int err = Marshal.GetLastPInvokeError();
+        RuType.Core.Log.Line($"SendInput: вставлено {sent} из {arr.Length} событий (ошибка {err})");
+        return false;
     }
 
     private static INPUT KeyDownVk(ushort vk) => new()

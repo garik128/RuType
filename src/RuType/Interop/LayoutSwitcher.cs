@@ -18,20 +18,31 @@ public sealed class LayoutSwitcher
     /// <summary>В системе есть и русская, и английская раскладки.</summary>
     public bool BothPresent => RuLayout != IntPtr.Zero && EnLayout != IntPtr.Zero;
 
+    /// <summary>
+    /// Перечитать раскладки системы. Каждый вызов определяет обе заново: раскладку
+    /// могли не только добавить, но и удалить - старый HKL не должен переживать
+    /// повторный Detect (иначе BothPresent врёт). Свойства присваиваются в конце,
+    /// одним шагом каждое: их читает поток хука, промежуточный ноль ему не виден.
+    /// </summary>
     public void Detect()
     {
+        IntPtr ru = IntPtr.Zero, en = IntPtr.Zero;
         uint count = GetKeyboardLayoutList(0, null);
-        if (count == 0) return;
-        var list = new IntPtr[count];
-        GetKeyboardLayoutList((int)count, list);
-
-        foreach (IntPtr hkl in list)
+        if (count > 0)
         {
-            // Младшее слово HKL - LANGID активной раскладки.
-            ushort langId = (ushort)(hkl.ToInt64() & 0xFFFF);
-            if (langId == LANGID_RU && RuLayout == IntPtr.Zero) RuLayout = hkl;
-            else if (langId == LANGID_EN && EnLayout == IntPtr.Zero) EnLayout = hkl;
+            var list = new IntPtr[count];
+            uint got = GetKeyboardLayoutList((int)count, list);
+            for (int i = 0; i < got && i < list.Length; i++)
+            {
+                IntPtr hkl = list[i];
+                // Младшее слово HKL - LANGID активной раскладки.
+                ushort langId = (ushort)(hkl.ToInt64() & 0xFFFF);
+                if (langId == LANGID_RU && ru == IntPtr.Zero) ru = hkl;
+                else if (langId == LANGID_EN && en == IntPtr.Zero) en = hkl;
+            }
         }
+        RuLayout = ru;
+        EnLayout = en;
     }
 
     /// <summary>Переключает раскладку окна в фокусе на указанную.</summary>

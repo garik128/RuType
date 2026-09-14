@@ -159,8 +159,64 @@ public static class SelfTest
                 sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} Pause после смены окна -> '{kb.Screen}'{(ok ? "" : " (ожидалось 'hello ')")}");
             }
 
+            // Поля пароля в браузере (быстрый Win32-детект их не видит, только UIA).
+            sb.AppendLine("СЦЕНАРИИ ПОЛЯ ПАРОЛЯ (фейковый UIA):");
+            void Pw(string name, bool ok, string screen, string expect)
+            {
+                if (!ok) scenFail++;
+                sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} {name} -> '{Visible(screen)}'{(ok ? "" : $" (ожидалось '{Visible(expect)}')")}");
+            }
+
+            // Логин -> Tab -> пароль быстрее TTL кеша. hwnd фокуса у браузера один на все
+            // поля, события фокуса нет: раньше закешированное на Tab "не пароль" жило в
+            // поле пароля, и 'ghbdtn' перекладывался в 'привет' (и попадал в лог правок).
+            {
+                var fx = new FakeExclusions();
+                var kb = new FakeKeyboard(scenAnalyzer, fx.Manager);
+                fx.Window = () => kb.Window;
+                kb.Type("hello\t");
+                fx.Password = true;               // фокус ушёл в поле пароля
+                kb.Type("ghbdtn\r");
+                Pw("логин, Tab, пароль быстрее TTL", kb.Screen == "hello\tghbdtn\r", kb.Screen, "hello\tghbdtn\r");
+            }
+
+            // Событие фокуса UIA: пароль отсекается уже на клавишах, прямой запрос не нужен.
+            {
+                var fx = new FakeExclusions();
+                var kb = new FakeKeyboard(scenAnalyzer, fx.Manager);
+                fx.Window = () => kb.Window;
+                fx.Manager.ReportFocusChanged(kb.Window, isPassword: true);
+                kb.Type("ghbdtn ");
+                Pw("событие фокуса: пароль", kb.Screen == "ghbdtn " && fx.Manager.UiaQueryCount == 0, kb.Screen, "ghbdtn ");
+            }
+
+            // Pause в браузерном поле пароля не перекладывает набранное.
+            {
+                var fx = new FakeExclusions { Password = true };
+                var kb = new FakeKeyboard(scenAnalyzer, fx.Manager);
+                fx.Window = () => kb.Window;
+                kb.Type("ghbdtn");
+                kb.Press(0x13, false);
+                Pw("Pause в поле пароля", kb.Screen == "ghbdtn", kb.Screen, "ghbdtn");
+            }
+
+            // Кеш по-прежнему экономит запросы в пределах одного поля, а TTL его обновляет.
+            {
+                var fx = new FakeExclusions();
+                var kb = new FakeKeyboard(scenAnalyzer, fx.Manager);
+                fx.Window = () => kb.Window;
+                kb.Type("hello world ghbdtn ");
+                int inField = fx.Manager.UiaQueryCount;
+                fx.Now += 2000;
+                kb.Type("test ");
+                bool ok = inField == 1 && fx.Manager.UiaQueryCount == 2 && kb.Screen == "hello world привет test ";
+                Pw($"кеш: запросов в поле {inField}, после TTL {fx.Manager.UiaQueryCount}", ok, kb.Screen, "hello world привет test ");
+            }
+
             sb.AppendLine(scenFail == 0 ? "  все сценарии пройдены" : $"  ПРОВАЛЕНО СЦЕНАРИЕВ: {scenFail}");
         }
+
+        int infraFail = RunInfraChecks(sb);
 
         string report = sb.ToString();
         string outPath = System.IO.Path.Combine(
@@ -168,7 +224,97 @@ public static class SelfTest
         System.IO.File.WriteAllText(outPath, report);
         Console.WriteLine(report);
         Console.WriteLine($"[report -> {outPath}]");
-        return !ruOk ? 2 : scenFail > 0 ? 3 : 0;
+        return !ruOk ? 2 : scenFail > 0 ? 3 : infraFail > 0 ? 4 : 0;
+    }
+
+    private static string Visible(string s) => s.Replace("\t", "<tab>").Replace("\r", "<enter>");
+
+    /// <summary>ExclusionManager на фейковых швах: окно, UIA-ответ и часы задаются тестом.</summary>
+    private sealed class FakeExclusions
+    {
+        public bool Password;
+        public long Now = 1_000_000;
+        public Func<IntPtr> Window = () => (IntPtr)1;
+        public readonly ExclusionManager Manager = new();
+
+        public FakeExclusions()
+        {
+            Manager.ForegroundWindow = () => Window();
+            Manager.FocusedControl = () => (IntPtr)10;   // браузер: один hwnd на все поля
+            Manager.NativePasswordCheck = _ => false;     // Win32-детект браузерный пароль не видит
+            Manager.UiaFocusedIsPassword = () => Password;
+            Manager.IsOwnProcessWindow = _ => false;
+            Manager.Clock = () => Now;
+        }
+    }
+
+    /// <summary>Проверки инфраструктуры: хранилище конфига, нормализация, уровень целостности.</summary>
+    private static int RunInfraChecks(StringBuilder sb)
+    {
+        int fail = 0;
+        void Check(string name, bool ok)
+        {
+            if (!ok) fail++;
+            sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} {name}");
+        }
+
+        sb.AppendLine("ИНФРАСТРУКТУРА:");
+        string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"rutype_selftest_{Environment.ProcessId}");
+        try
+        {
+            System.IO.Directory.CreateDirectory(dir);
+            var store = new ConfigStore(dir);
+
+            // Битый config.json: дефолты, копия .broken, сам файл не перезаписан.
+            const string broken = "{ \"typo\": { \"min_word_length\": 3,";
+            System.IO.File.WriteAllText(store.ConfigPath, broken);
+            var cfg = store.Load();
+            var backups = System.IO.Directory.GetFiles(dir, "config.json.broken-*");
+            Check("битый конфиг: предупреждение + копия .broken + исходник цел",
+                store.LoadProblem != null && backups.Length == 1
+                && System.IO.File.ReadAllText(backups[0]) == broken
+                && System.IO.File.ReadAllText(store.ConfigPath) == broken
+                && cfg.Typo.MinWordLength == new AppConfig().Typo.MinWordLength);
+
+            // null-секции и значения вне диапазона приводятся к допустимым.
+            System.IO.File.WriteAllText(store.ConfigPath,
+                "{\"typo\": null, \"layout\": {\"min_word_length\": -5, \"hotkey_undo_vk\": 999}, \"tray\": {\"blink_ms\": 999999}, \"exclusions\": {\"app_blacklist\": null}}");
+            cfg = store.Load();
+            Check("нормализация: null-секции и диапазоны",
+                store.LoadProblem == null && cfg.Typo != null && cfg.Layout.MinWordLength == 1
+                && cfg.Layout.HotkeyUndoVk == 255 && cfg.Tray.BlinkMs == 10000 && cfg.Exclusions.AppBlacklist != null);
+
+            // Нормализация не трогает корректные значения (дефолты проходят как есть).
+            var defaults = new AppConfig();
+            string before = System.Text.Json.JsonSerializer.Serialize(defaults);
+            defaults.Normalize();
+            Check("нормализация не меняет корректный конфиг", before == System.Text.Json.JsonSerializer.Serialize(defaults));
+
+            // Атомарная запись: временный файл не остаётся, перечитывается то же.
+            cfg.Suggestions.Threshold = 7;
+            store.Save(cfg);
+            var reloaded = store.Load();
+            Check("атомарная запись: без .tmp, значения сохранены",
+                !System.IO.File.Exists(store.ConfigPath + ".tmp") && reloaded.Suggestions.Threshold == 7 && store.LoadProblem == null);
+
+            Check("лог правок по умолчанию выключен", !new AppConfig().Learning.Enabled);
+        }
+        catch (Exception ex)
+        {
+            Check($"хранилище конфига: исключение {ex.Message}", false);
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(dir, recursive: true); } catch { }
+        }
+
+        uint il = ExclusionManager.OwnIntegrityLevel;
+        Check($"уровень целостности процесса прочитан (0x{il:X})", il >= 0x1000);
+        IntPtr shell = NativeMethods.GetShellWindow();
+        if (shell != IntPtr.Zero)
+            Check("окно рабочего стола (explorer) не считается окном с правами выше", !new ExclusionManager().IsAboveOwnIntegrity(shell));
+
+        return fail;
     }
 
     /// <summary>
@@ -229,6 +375,7 @@ public static class SelfTest
             }
             EnMap[(0x20, false)] = " "; RuMap[(0x20, false)] = " ";
             EnMap[(0x09, false)] = "	"; RuMap[(0x09, false)] = "	";
+            EnMap[(0x0D, false)] = "\r"; RuMap[(0x0D, false)] = "\r";
 
             foreach (var kv in EnMap)
                 if (kv.Value.Length == 1 && !EnRev.ContainsKey(kv.Value[0]))
@@ -241,9 +388,9 @@ public static class SelfTest
             return map.TryGetValue((vk, shift), out var s) ? s : null;
         }
 
-        public FakeKeyboard(Analyzer analyzer)
+        public FakeKeyboard(Analyzer analyzer, ExclusionManager? exclusions = null)
         {
-            _proc = new InputProcessor(analyzer, dispatcher: null)
+            _proc = new InputProcessor(analyzer, dispatcher: null, exclusions, skipPasswordFields: exclusions != null)
             {
                 RuLayout = Ru,
                 EnLayout = En,

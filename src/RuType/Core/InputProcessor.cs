@@ -3,14 +3,19 @@ using RuType.Interop;
 
 namespace RuType.Core;
 
-public sealed record ReplacementRequest(int Backspaces, string Text, ActionKind Kind, LayoutTarget Layout = LayoutTarget.None, int TrailingVk = 0, string Original = "", string Corrected = "");
+/// <summary>
+/// Автозамена слова. Window - активное окно на момент решения: если к моменту инъекции
+/// оно сменилось, backspace ушли бы в чужой текст - исполнитель замену отменяет.
+/// </summary>
+public sealed record ReplacementRequest(int Backspaces, string Text, ActionKind Kind, LayoutTarget Layout = LayoutTarget.None, int TrailingVk = 0, string Original = "", string Corrected = "", IntPtr Window = default);
 
 /// <summary>
 /// Переключение между исправленным и исходным вариантом по хоткею (Pause).
 /// Backspaces - сколько стереть, Text - что впечатать, ActivateLayout - на какую
-/// раскладку переключиться (None - не трогать), TrailingVk - дожать Enter/Tab.
+/// раскладку переключиться (None - не трогать), TrailingVk - дожать Enter/Tab,
+/// Window - активное окно на момент решения (см. ReplacementRequest).
 /// </summary>
-public sealed record ToggleRequest(int Backspaces, string Text, LayoutTarget ActivateLayout, int TrailingVk = 0);
+public sealed record ToggleRequest(int Backspaces, string Text, LayoutTarget ActivateLayout, int TrailingVk = 0, IntPtr Window = default);
 
 /// <summary>
 /// Связывает поток нажатий с буфером слова и анализатором. На границе слова
@@ -122,7 +127,7 @@ public sealed class InputProcessor
     // Исключения (опционально): чёрный список приложений и поля паролей.
     private readonly Interop.ExclusionManager? _exclusions;
     private IntPtr _lastForeground = IntPtr.Zero;
-    private bool _foregroundBlacklisted;
+    private bool _foregroundExcluded;
 
     /// <summary>Пропускать поля паролей (применяется на лету из настроек).</summary>
     public bool SkipPasswordFields { get; set; }
@@ -170,6 +175,30 @@ public sealed class InputProcessor
         _recentCorrectedOriginal = null;
     }
 
+    /// <summary>
+    /// Исключения изменились (чёрный список в настройках): пересчитать их для активного
+    /// окна на следующем нажатии, не дожидаясь смены окна.
+    /// </summary>
+    public void RefreshExclusions()
+    {
+        _lastForeground = IntPtr.Zero;
+        ResetWordState();
+    }
+
+    // Чёрный список или процесс с уровнем целостности выше нашего: UIPI не пропустит
+    // туда SendInput, а подавленную границу вернуть будет уже нечем.
+    private bool IsExcludedWindow(IntPtr fg)
+    {
+        if (_exclusions == null) return false;
+        if (_exclusions.IsBlacklistedApp(fg)) return true;
+        if (_exclusions.IsAboveOwnIntegrity(fg))
+        {
+            Log.Line("окно процесса с правами выше наших - автозамена отключена для него");
+            return true;
+        }
+        return false;
+    }
+
     public void OnKey(object? sender, KeyboardHook.KeyArgs e)
     {
         if (!e.IsKeyDown) return;
@@ -185,9 +214,13 @@ public sealed class InputProcessor
         if (fg != _lastForeground)
         {
             _lastForeground = fg;
-            _foregroundBlacklisted = _exclusions?.IsBlacklistedApp(fg) ?? false;
+            _foregroundExcluded = IsExcludedWindow(fg);
             ResetWordState();
         }
+
+        // Исключённое окно (чёрный список, процесс с правами выше наших) - ДО хоткеев:
+        // там не подавляем ни одной клавиши и ничего не впечатываем.
+        if (_foregroundExcluded) { ResetWordState(); return; }
 
         // Второй хоткей: вызвать окно слова вручную для последнего слова.
         if (SuggestHotkeyVk != 0 && e.VkCode == (uint)SuggestHotkeyVk)
@@ -198,8 +231,19 @@ public sealed class InputProcessor
 
         // Хоткей Pause (контекстно): если по слову была автоправка - переключаем её;
         // иначе перебиваем раскладку сырого сегмента (буквы+знаки), затем - запасной
-        // вариант по последнему завершённому слову.
-        if (e.VkCode == (uint)HotkeyVk) { if (TryToggle() || TrySegmentRemap() || TryForceLayout()) e.Suppress = true; return; }
+        // вариант по последнему завершённому слову. В поле пароля - ничего: перекладка
+        // впечатала бы (и записала в debug-лог) набранный пароль. Проверка полная (UIA),
+        // браузерное поле пароля быстрый детект может не увидеть; Pause жмут редко.
+        if (e.VkCode == (uint)HotkeyVk)
+        {
+            if (SkipPasswordFields && _exclusions != null && _exclusions.IsPasswordThorough())
+            {
+                ResetWordState();
+                return;
+            }
+            if (TryToggle() || TrySegmentRemap() || TryForceLayout()) e.Suppress = true;
+            return;
+        }
 
         // Любой другой ввод фиксирует ОТКАТ - его хоткей больше недоступен. А вот
         // force (ручная перекладка завершённого слова) намеренно НЕ гасим здесь:
@@ -207,17 +251,22 @@ public sealed class InputProcessor
         // после знака+пробела не срабатывает. Гасим force только в начале нового слова.
         _toggleAvailable = false;
 
-        // Исключения: чёрный список приложений и быстрый детект поля пароля.
-        // В исключённом контексте не трогаем и не логируем ввод.
-        if (_foregroundBlacklisted) { ResetTyping(); return; }
-        if (SkipPasswordFields && _exclusions != null && _exclusions.IsPasswordFast()) { ResetTyping(); return; }
+        // Быстрый детект поля пароля (нативный ES_PASSWORD или флаг из событий фокуса
+        // UIA). В исключённом контексте не трогаем и не логируем ввод.
+        if (SkipPasswordFields && _exclusions != null && _exclusions.IsPasswordFast())
+        {
+            ResetTyping();
+            if (e.VkCode == VK_TAB || e.VkCode == VK_RETURN) _exclusions.InvalidateFocusCache(); // фокус уходит
+            return;
+        }
 
         // Сочетания с Ctrl/Alt/Win - команды, не текст. ToUnicodeEx при зажатом Alt
         // всё равно возвращает символ (табуляцию для Alt+Tab, перевод строки для
         // Alt+Enter, буквы для Alt+F), поэтому без этой отсечки Alt+Tab с невалидным
         // словом в буфере срабатывал как граница: правка улетала в чужое окно, а сам
-        // Alt+Tab глушился подавлением клавиши.
-        if (CommandChordHeld()) { ResetTyping(); ResetForce(); return; }
+        // Alt+Tab глушился подавлением клавиши. Ctrl+Tab, Alt+Tab и подобные уводят
+        // фокус - кешированный ответ "не пароль" больше не действителен.
+        if (CommandChordHeld()) { ResetTyping(); ResetForce(); _exclusions?.InvalidateFocusCache(); return; }
 
         if (e.VkCode == VK_BACK)
         {
@@ -229,8 +278,11 @@ public sealed class InputProcessor
         }
 
         IntPtr layout = CurrentLayout();
+        // Отдельные нажатия НЕ логируются даже в debug-режиме: на этом шаге полная
+        // (UIA) проверка поля пароля ещё не выполнена, и символы браузерного пароля
+        // оказались бы в rutype_debug.log. Слово пишется в лог только на границе,
+        // после проверки.
         string? ch = TranslateLive(e.VkCode, e.ScanCode, layout);
-        Log.Line($"key vk=0x{e.VkCode:X2} scan={e.ScanCode} ch={(ch == null ? "<null>" : "'" + ch + "'")} buf='{_buffer.Current}'");
 
         if (ch == null)
         {
@@ -277,13 +329,22 @@ public sealed class InputProcessor
         // логирования: ветки сырого прогона (правило/перекладка ',fylbn') и loop-guard
         // ниже тоже эмитят события, поэтому проверка стоит перед ними, а не только
         // перед Analyze. Дёшево: результат кешируется (ExclusionManager).
-        if (SkipPasswordFields && _exclusions != null && (word.Length > 0 || _segment.Count > 0)
-            && _exclusions.IsPasswordThorough())
+        if (SkipPasswordFields && _exclusions != null)
         {
-            Log.Line("boundary: поле пароля (UIA) - пропуск");
-            ResetSegment();
-            ResetForce();
-            return;
+            bool isPassword = (word.Length > 0 || _segment.Count > 0) && _exclusions.IsPasswordThorough();
+
+            // Tab/Enter обычно уводят фокус (логин -> пароль, отправка формы): ответ,
+            // полученный сейчас, описывает покидаемое поле. Без сброса кеша пароль,
+            // набранный быстрее TTL после Tab из поля логина, считался бы обычным словом.
+            if (isEnterTab) _exclusions.InvalidateFocusCache();
+
+            if (isPassword)
+            {
+                Log.Line("boundary: поле пароля (UIA) - пропуск");
+                ResetSegment();
+                ResetForce();
+                return;
+            }
         }
 
         if (isSpace || isEnterTab)
@@ -454,7 +515,7 @@ public sealed class InputProcessor
         e.Suppress = true;
         ResetSegment(); // текст изменили - сырой сегмент устарел
 
-        var req = new ReplacementRequest(original.Length, decision.Replacement + sepText, decision.Kind, decision.Layout, sepVk, original, decision.Replacement);
+        var req = new ReplacementRequest(original.Length, decision.Replacement + sepText, decision.Kind, decision.Layout, sepVk, original, decision.Replacement, _lastForeground);
 
         _toggle = new ToggleState
         {
@@ -490,7 +551,8 @@ public sealed class InputProcessor
                 Backspaces: t.Corrected.Length + t.SepFootprint,
                 Text: t.Original + t.Separator,
                 ActivateLayout: t.Kind == ActionKind.Layout ? Opposite(t.Target) : LayoutTarget.None,
-                TrailingVk: t.SepVk);
+                TrailingVk: t.SepVk,
+                Window: _lastForeground);
             if (!t.Counted)
             {
                 t.Counted = true;
@@ -504,7 +566,8 @@ public sealed class InputProcessor
                 Backspaces: t.Original.Length + t.SepFootprint,
                 Text: t.Corrected + t.Separator,
                 ActivateLayout: t.Kind == ActionKind.Layout ? t.Target : LayoutTarget.None,
-                TrailingVk: t.SepVk);
+                TrailingVk: t.SepVk,
+                Window: _lastForeground);
         }
 
         t.ShowingCorrected = !t.ShowingCorrected;
@@ -842,7 +905,7 @@ public sealed class InputProcessor
     private void EmitForce(int backspaces, string text, LayoutTarget target, int trailingVk)
     {
         Log.Line($"force-layout: -{backspaces} +'{text}' ({target}) vk={trailingVk}");
-        var req = new ToggleRequest(backspaces, text, target, trailingVk);
+        var req = new ToggleRequest(backspaces, text, target, trailingVk, _lastForeground);
         Post(() => ToggleRequested?.Invoke(req));
     }
 

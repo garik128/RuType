@@ -17,10 +17,27 @@ public sealed class MouseHook : IDisposable
 
     public MouseHook() => _proc = HookCallback;
 
+    public bool IsInstalled => _hookHandle != IntPtr.Zero;
+
+    /// <summary>
+    /// Установить хук. Молча не установленный хук опасен: клик больше не сбрасывает
+    /// набор, и следующая правка сотрёт текст не там, где каретка. Поэтому ошибка -
+    /// исключение, как у клавиатурного хука.
+    /// </summary>
     public void Install()
     {
-        if (_hookHandle != IntPtr.Zero) return;
+        if (IsInstalled) return;
         _hookHandle = SetWindowsHookEx(WH_MOUSE_LL, _proc, GetModuleHandle(null), 0);
+        if (_hookHandle == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Не удалось установить хук мыши (SetWindowsHookEx вернул 0, ошибка {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}).");
+    }
+
+    /// <summary>Переустановить хук (система молча снимает LL-хук после таймаута обработчика).</summary>
+    public void Reinstall()
+    {
+        Uninstall();
+        Install();
     }
 
     public void Uninstall()

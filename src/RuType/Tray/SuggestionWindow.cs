@@ -102,7 +102,9 @@ public sealed class SuggestionWindow : Window
     {
         _outsideClickHook = new MouseHook();
         _outsideClickHook.ButtonDown += OnGlobalMouseDown;
-        _outsideClickHook.Install();
+        // Без хука окно закрывается только кнопками - не повод ронять программу.
+        try { _outsideClickHook.Install(); }
+        catch (Exception ex) { RuType.Core.Log.Line($"suggestion window: {ex.Message}"); }
     }
 
     private void OnClosedUninstallHook(object? sender, EventArgs e)

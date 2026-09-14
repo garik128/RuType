@@ -4,7 +4,7 @@ using System.Text.Json;
 namespace RuType.Config;
 
 /// <summary>
-/// Каталог данных в %APPDATA%\RuType\ и чтение/запись config.json.
+/// Каталог данных data\ рядом с exe и чтение/запись config.json.
 /// Пользовательские списки (my_words/stopwords/rules) - текстовые файлы рядом.
 /// </summary>
 public sealed class ConfigStore
@@ -25,16 +25,32 @@ public sealed class ConfigStore
         PropertyNameCaseInsensitive = true
     };
 
+    /// <summary>
+    /// Последняя загрузка не удалась: config.json не прочитан и программа работает на
+    /// дефолтах. Текст - для пользователя (куда сохранена копия испорченного файла).
+    /// null - загрузка прошла нормально.
+    /// </summary>
+    public string? LoadProblem { get; private set; }
+
+    private readonly object _saveLock = new();
+
     public ConfigStore()
+        : this(Path.Combine(AppContext.BaseDirectory, "data"))
+    {
+    }
+
+    /// <summary>Хранилище в произвольном каталоге данных (для самопроверки).</summary>
+    public ConfigStore(string dataDir)
     {
         // Портабл: все данные пользователя в подпапке data рядом с exe.
         AppDir = AppContext.BaseDirectory;
-        DataDir = Path.Combine(AppDir, "data");
+        DataDir = dataDir;
         Directory.CreateDirectory(DataDir);
     }
 
     public AppConfig Load()
     {
+        LoadProblem = null;
         if (!File.Exists(ConfigPath))
         {
             var fresh = new AppConfig();
@@ -45,20 +61,66 @@ public sealed class ConfigStore
         try
         {
             string json = File.ReadAllText(ConfigPath);
-            return JsonSerializer.Deserialize<AppConfig>(json, JsonOpts) ?? new AppConfig();
+            var cfg = JsonSerializer.Deserialize<AppConfig>(json, JsonOpts)
+                      ?? throw new JsonException("config.json пуст (null)");
+            cfg.Normalize();
+            return cfg;
         }
-        catch
+        catch (Exception ex)
         {
-            // Битый конфиг не должен ронять программу - откатываемся к дефолтам.
+            // Битый конфиг не должен ронять программу, но и молча затираться дефолтами
+            // тоже: копия испорченного файла откладывается рядом, а вызывающий код по
+            // LoadProblem не пересохраняет конфиг на старте и предупреждает пользователя.
+            string? backup = BackupBroken();
+            LoadProblem = backup != null
+                ? $"config.json не прочитан ({ex.Message}). Копия сохранена как {Path.GetFileName(backup)}; загружены настройки по умолчанию."
+                : $"config.json не прочитан ({ex.Message}), и сделать его копию не удалось. Загружены настройки по умолчанию; файл пока не перезаписан.";
+            Core.Log.Line($"config: {LoadProblem}");
             return new AppConfig();
         }
     }
 
+    // Копия нечитаемого config.json: config.json.broken-ГГГГММДД-ЧЧММСС.
+    private string? BackupBroken()
+    {
+        try
+        {
+            string path = $"{ConfigPath}.broken-{DateTime.Now:yyyyMMdd-HHmmss}";
+            File.Copy(ConfigPath, path, overwrite: false);
+            return path;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Атомарная запись: во временный файл с flush на диск, затем переименование поверх
+    /// config.json. Сбой питания или падение посреди записи оставляет либо старый, либо
+    /// новый файл целиком - а не полупустой, который при старте превратился бы в дефолты.
+    /// </summary>
     public void Save(AppConfig config)
     {
+        config.Normalize(); // значения из формы настроек - в допустимые диапазоны
         string json = JsonSerializer.Serialize(config, JsonOpts);
-        File.WriteAllText(ConfigPath, json);
+        string tmp = ConfigPath + ".tmp";
+        lock (_saveLock)
+        {
+            using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+            using (var w = new StreamWriter(fs, new System.Text.UTF8Encoding(false)))
+            {
+                w.Write(json);
+                w.Flush();
+                fs.Flush(flushToDisk: true);
+            }
+            File.Move(tmp, ConfigPath, overwrite: true);
+        }
     }
+
+    /// <summary>Независимая копия настроек (снимок для потока хука).</summary>
+    public static AppConfig Clone(AppConfig config)
+        => JsonSerializer.Deserialize<AppConfig>(JsonSerializer.Serialize(config, JsonOpts), JsonOpts)!;
 
     /// <summary>Гарантирует существование пользовательских текстовых списков.</summary>
     public void EnsureUserLists()
