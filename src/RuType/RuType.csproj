@@ -13,7 +13,7 @@
     <ApplicationIcon>..\..\assets\icon.ico</ApplicationIcon>
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
-    <Version>1.1.1</Version>
+    <Version>1.1.2</Version>
     <Authors>RuType</Authors>
     <Description>Фоновый автокорректор опечаток и раскладки ru/en для Windows</Description>
   </PropertyGroup>
