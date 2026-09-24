@@ -9,6 +9,7 @@ public sealed class AppConfig
     public GeneralCfg General { get; set; } = new();
     public TypoCfg Typo { get; set; } = new();
     public LayoutCfg Layout { get; set; } = new();
+    public CaseCfg Case { get; set; } = new();
     public SoundCfg Sound { get; set; } = new();
     public TrayCfg Tray { get; set; } = new();
     public SuggestionsCfg Suggestions { get; set; } = new();
@@ -30,6 +31,7 @@ public sealed class AppConfig
         General ??= d.General;
         Typo ??= d.Typo;
         Layout ??= d.Layout;
+        Case ??= d.Case;
         Sound ??= d.Sound;
         Tray ??= d.Tray;
         Suggestions ??= d.Suggestions;
@@ -55,6 +57,7 @@ public sealed class AppConfig
         Layout.FixTypoMinLength = Math.Clamp(Layout.FixTypoMinLength, 1, 50);
         Layout.HotkeyUndoVk = Math.Clamp(Layout.HotkeyUndoVk, 0, 255);
         Layout.HotkeySuggestVk = Math.Clamp(Layout.HotkeySuggestVk, 0, 255);
+        Case.HotkeyVk = Math.Clamp(Case.HotkeyVk, 0, 255);
 
         Sound.TypoWav = Str(Sound.TypoWav, d.Sound.TypoWav);
         Sound.LayoutWav = Str(Sound.LayoutWav, d.Sound.LayoutWav);
@@ -160,6 +163,18 @@ public sealed class AppConfig
         // ('куфвьуюьв' -> 'readme.md', 'пщщпдуюсщь' -> 'google.com'). Словарём такие
         // токены не проверить, опора - структура 'имя.ext' с известным TLD/расширением.
         public bool SwitchKnownDomainExt { get; set; } = true;
+    }
+
+    public sealed class CaseCfg
+    {
+        // Исправлять "ДВе заглавные" в начале слова: 'ДВе' -> 'Две', 'THe' -> 'The'.
+        // Только если результат - словарное слово; тех-токены из en_extra (MHz, OAuth)
+        // и множественное аббревиатур ('IDs') не трогаются.
+        public bool FixTwoCapitals { get; set; } = true;
+        // Хоткей смены регистра последнего слова (строчные -> ПРОПИСНЫЕ -> Первая
+        // прописная). По умолчанию Shift+Pause. 0 - выкл.
+        public int HotkeyVk { get; set; } = 0x13;
+        public bool HotkeyShift { get; set; } = true;
     }
 
     public sealed class SoundCfg

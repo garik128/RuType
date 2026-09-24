@@ -128,6 +128,17 @@ public static class Eval
         };
         foreach (var (i, e) in mixed) yield return new Case("mixed", i, e, false);
 
+        // "ДВе заглавные" в начале слова (case.fix_two_capitals).
+        var twoCaps = new (string, string)[]
+        {
+            ("ДВе", "Две"), ("ПРивет", "Привет"), ("СЕгодня", "Сегодня"), ("THe", "The"),
+            ("HEllo", "Hello"), ("GHbdtn", "Привет"), ("ПРивт", "Привет"), ("СТол", "Стол"),
+        };
+        foreach (var (i, e) in twoCaps) yield return new Case("two_caps", i, e, false);
+        // Аббревиатуры, их множественное и тех-токены с каноничным регистром - не трогать.
+        foreach (var w in new[] { "IDs", "PCs", "MHz", "GHz", "OAuth", "USB", "ООО", "СССР", "ВКонтакте", "IPhone", "МойОфис" })
+            yield return new Case("keep_caps", w, w, true);
+
         // Нормальные русские слова - не трогать (в т.ч. редкие формы, англицизмы).
         foreach (var w in new[] { "кошка", "документ", "сегодня", "привет", "программа",
                                   "работает", "вкладки", "вкладок", "ноутбук", "деплой",

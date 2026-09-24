@@ -26,8 +26,10 @@ public sealed class SettingsWindow : Window
     private CheckBox _beepTypo = null!, _beepLayout = null!;
     private CheckBox _suggestEnabled = null!;
     private TextBox _threshold = null!;
-    private TextBox _hotkeyBox = null!, _suggestBox = null!;
-    private int _hotkeyVk, _suggestVk;
+    private TextBox _hotkeyBox = null!, _suggestBox = null!, _caseBox = null!;
+    private int _hotkeyVk, _suggestVk, _caseVk;
+    private bool _caseShift;
+    private CheckBox _twoCaps = null!;
 
     private CheckBox _typoEnabled = null!;
     private RadioButton _ed1 = null!, _ed2 = null!;
@@ -54,6 +56,8 @@ public sealed class SettingsWindow : Window
         _onSaved = onSaved;
         _hotkeyVk = cfg.Layout.HotkeyUndoVk;
         _suggestVk = cfg.Layout.HotkeySuggestVk;
+        _caseVk = cfg.Case.HotkeyVk;
+        _caseShift = cfg.Case.HotkeyShift;
 
         Title = "RuType — настройки";
         Width = Math.Max(cfg.Ui.SettingsWidth, 760);
@@ -195,11 +199,14 @@ public sealed class SettingsWindow : Window
             "Автозапуск через реестр текущего пользователя, без прав администратора. При переносе папки включите заново.");
 
         var keys = Card(p, "Горячие клавиши");
-        _hotkeyBox = HotkeyRow(keys, "Откат правки / смена раскладки", _hotkeyVk, v => _hotkeyVk = v,
+        _hotkeyBox = HotkeyRow(keys, "Откат правки / смена раскладки", _hotkeyVk, false, false, (v, _) => _hotkeyVk = v,
             "Если слово только что исправлено, клавиша возвращает исходный вариант (и обратно). " +
             "Иначе переключает раскладку набираемого или последнего слова: буквы и знаки, хоть один символ.");
-        _suggestBox = HotkeyRow(keys, "Окно слова", _suggestVk, v => _suggestVk = v,
+        _suggestBox = HotkeyRow(keys, "Окно слова", _suggestVk, false, false, (v, _) => _suggestVk = v,
             "Открывает для последнего слова окно действий: не трогать, правило, смена раскладки.");
+        _caseBox = HotkeyRow(keys, "Смена регистра", _caseVk, _caseShift, true, (v, sh) => { _caseVk = v; _caseShift = sh; },
+            "Меняет регистр набираемого или последнего слова по кругу: строчные, ПРОПИСНЫЕ, Первая прописная. " +
+            "Можно назначить клавишу вместе с Shift.");
 
         var sound = Card(p, "Звук");
         _beepTypo = Toggle(sound, "Сигнал при исправлении опечатки", _cfg.Sound.BeepOnTypo, "");
@@ -224,6 +231,9 @@ public sealed class SettingsWindow : Window
             "Слово, которого нет в словаре, заменяется ближайшим словарным, если выбор однозначен. Существующие слова не трогаются.");
         _minWordLen = Number(main, "Минимальная длина слова", _cfg.Typo.MinWordLength.ToString(),
             "Более короткие слова не исправляются: слишком велик риск ошибиться.");
+        _twoCaps = Toggle(main, "Исправлять ДВе заглавные", _cfg.Case.FixTwoCapitals,
+            "Две прописные в начале слова: ДВе становится Две, THe становится The. Только если получается словарное слово; " +
+            "аббревиатуры (USB, IDs) и тех-токены (MHz, OAuth) не трогаются. Работает независимо от исправления опечаток.");
 
         var dist = new StackPanel();
         _ed1 = new RadioButton { Content = "1 отличие, консервативно", GroupName = "ed", IsChecked = _cfg.Typo.MaxEditDistance <= 1, Margin = new Thickness(0, 0, 0, 6) };
@@ -381,6 +391,9 @@ public sealed class SettingsWindow : Window
         _cfg.Suggestions.Threshold = ParseInt(_threshold.Text, _cfg.Suggestions.Threshold);
         _cfg.Layout.HotkeyUndoVk = _hotkeyVk;
         _cfg.Layout.HotkeySuggestVk = _suggestVk;
+        _cfg.Case.HotkeyVk = _caseVk;
+        _cfg.Case.HotkeyShift = _caseShift;
+        _cfg.Case.FixTwoCapitals = _twoCaps.IsChecked == true;
 
         _cfg.Typo.Enabled = _typoEnabled.IsChecked == true;
         _cfg.Typo.MaxEditDistance = _ed2.IsChecked == true ? 2 : 1;
@@ -490,11 +503,12 @@ public sealed class SettingsWindow : Window
         return tb;
     }
 
-    private TextBox HotkeyRow(StackPanel card, string title, int vk, Action<int> onCaptured, string desc)
+    private TextBox HotkeyRow(StackPanel card, string title, int vk, bool shift, bool allowShift,
+        Action<int, bool> onCaptured, string desc)
     {
         var box = new TextBox
         {
-            Text = KeyName(vk),
+            Text = HotkeyName(vk, shift),
             IsReadOnly = true,
             Width = 160,
             TextAlignment = TextAlignment.Center,
@@ -502,7 +516,7 @@ public sealed class SettingsWindow : Window
             ToolTip = "Кликните и нажмите клавишу"
         };
         box.GotKeyboardFocus += (_, _) => { box.Text = "нажмите клавишу…"; };
-        box.LostKeyboardFocus += (_, _) => { box.Text = KeyName(vk); };
+        box.LostKeyboardFocus += (_, _) => { box.Text = HotkeyName(vk, shift); };
         box.PreviewKeyDown += (_, e) =>
         {
             Key key = e.Key == Key.System ? e.SystemKey : e.Key;
@@ -511,8 +525,9 @@ public sealed class SettingsWindow : Window
                 or Key.LeftAlt or Key.RightAlt or Key.LWin or Key.RWin)
                 return;
             vk = KeyInterop.VirtualKeyFromKey(key);
-            onCaptured(vk);
-            box.Text = KeyName(vk);
+            shift = allowShift && (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
+            onCaptured(vk, shift);
+            box.Text = HotkeyName(vk, shift);
             Keyboard.ClearFocus();
         };
         Row(card, title, desc, box);
@@ -545,6 +560,8 @@ public sealed class SettingsWindow : Window
         Grid.SetRow(el, row);
         g.Children.Add(el);
     }
+
+    private static string HotkeyName(int vk, bool shift) => shift ? "Shift+" + KeyName(vk) : KeyName(vk);
 
     private static string KeyName(int vk)
     {

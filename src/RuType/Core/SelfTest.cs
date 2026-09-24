@@ -1,3 +1,4 @@
+using System.IO;
 using System.Text;
 using RuType.Config;
 using RuType.Interop;
@@ -132,6 +133,70 @@ public static class SelfTest
                 bool ok = kb.Screen == expect;
                 if (!ok) scenFail++;
                 sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} '{keys}' -> '{kb.Screen}'{(ok ? "" : $" (ожидалось '{expect}')")}");
+            }
+
+            // Правила на границе-знаке-букве: правило-перекладка 'bp=из' не должно рвать
+            // 'избранное' ('bp,hfyyjt') на запятой ('б' в RU). Правила берутся из
+            // временного файла, пользовательские списки потом восстанавливаются.
+            {
+                string tmpRules = Path.Combine(Path.GetTempPath(), "rutype_selftest_rules.txt");
+                File.WriteAllText(tmpRules, "bp=из\nthx=thanks\n", new UTF8Encoding(false));
+                dict.LoadUserLists(store.MyWordsPath, store.StopWordsPath, tmpRules);
+                try
+                {
+                    foreach (var (keys, expect) in new (string, string)[]
+                    {
+                        ("bp,hfyyjt ", "избранное "), // правило-префикс не рвёт слово на ','
+                        ("bp ",        "из "),        // само правило на пробеле работает
+                        ("thx, ",      "thanks, "),   // правило той же письменности на знаке
+                    })
+                    {
+                        var kb = new FakeKeyboard(scenAnalyzer);
+                        kb.Type(keys);
+                        bool ok = kb.Screen == expect;
+                        if (!ok) scenFail++;
+                        sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} правило: '{keys}' -> '{kb.Screen}'{(ok ? "" : $" (ожидалось '{expect}')")}");
+                    }
+                }
+                finally
+                {
+                    dict.LoadUserLists(store.MyWordsPath, store.StopWordsPath, store.RulesPath);
+                    try { File.Delete(tmpRules); } catch { }
+                }
+            }
+
+            // Регистр: "ДВе заглавные" на границе и хоткей Shift+Pause (по кругу).
+            // Шаги: строка - набор клавиш, "^" - Shift+Pause, "|" - Pause.
+            foreach (var (steps, expect, startRu) in new (string[], string, bool)[]
+            {
+                (new[] { "LDt " },                "Две ",       true),  // ДВе -> Две
+                (new[] { "THe " },                "The ",       false), // THe -> The
+                (new[] { "GHbdtn " },             "Привет ",    false), // регистр + раскладка
+                (new[] { "IDs " },                "IDs ",       false), // keep: множественное аббревиатуры
+                (new[] { "MHz " },                "MHz ",       false), // keep: тех-токен из en_extra
+                (new[] { "hello ", "^" },         "HELLO ",     false), // строчные -> ПРОПИСНЫЕ
+                (new[] { "hello ", "^", "^" },    "Hello ",     false), // -> Первая прописная
+                (new[] { "hello ", "^", "^", "^" }, "hello ",   false), // -> строчные
+                (new[] { "hello, ", "^" },        "HELLO, ",    false), // хвост разделителей сохраняется
+                (new[] { "hel", "^", "lo " },     "HELlo ",     false), // набираемое слово
+                (new[] { "ghbdtn ", "^" },        "ПРИВЕТ ",    false), // после автоправки - исправленное
+                (new[] { "ghbdtn ", "|", "^" },   "GHBDTN ",    false), // после отката - исходное
+                (new[] { "ghbdtn ", "|" },        "ghbdtn ",    false), // Pause без Shift - откат, как раньше
+                (new[] { "hello w", "^" },        "hello W",    false), // только текущее слово
+            })
+            {
+                var kb = new FakeKeyboard(scenAnalyzer);
+                if (startRu) kb.Current = FakeKeyboard.Ru;
+                foreach (var st in steps)
+                {
+                    if (st == "^") kb.Press(0x13, true);
+                    else if (st == "|") kb.Press(0x13, false);
+                    else kb.Type(st);
+                }
+                string name = string.Join("", steps).Replace("^", "<S+Pause>").Replace("|", "<Pause>");
+                bool ok = kb.Screen == expect;
+                if (!ok) scenFail++;
+                sb.AppendLine($"  {(ok ? "OK  " : "FAIL")} регистр: '{name}' -> '{kb.Screen}'{(ok ? "" : $" (ожидалось '{expect}')")}");
             }
 
             // Alt+Tab с невалидным словом в буфере: Tab при зажатом Alt - команда, а не

@@ -217,6 +217,9 @@ public sealed class Dictionaries
         return _ruHun.Check(word) || _ruHun.Check(lower);
     }
 
+    /// <summary>Токен из en_extra (тех-токен/аббревиатура со своим каноничным регистром: MHz, OAuth).</summary>
+    public bool IsEnExtra(string lowerWord) => _enExtraWords.Contains(lowerWord);
+
     /// <summary>Слово - валидное английское (Hunspell либо словарь-дополнение en_extra).</summary>
     public bool IsValidEn(string word)
     {

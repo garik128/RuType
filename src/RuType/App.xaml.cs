@@ -191,6 +191,8 @@ public partial class App : Application
             Enabled = _cfg.General.Enabled,
             HotkeyVk = _cfg.Layout.HotkeyUndoVk,
             SuggestHotkeyVk = _cfg.Layout.HotkeySuggestVk,
+            CaseHotkeyVk = _cfg.Case.HotkeyVk,
+            CaseHotkeyShift = _cfg.Case.HotkeyShift,
             RuLayout = _layout.RuLayout,
             EnLayout = _layout.EnLayout
         };
@@ -433,6 +435,8 @@ public partial class App : Application
             _processor.SkipPasswordFields = snapshot.Exclusions.SkipPasswordFields;
             _processor.HotkeyVk = snapshot.Layout.HotkeyUndoVk;
             _processor.SuggestHotkeyVk = snapshot.Layout.HotkeySuggestVk;
+            _processor.CaseHotkeyVk = snapshot.Case.HotkeyVk;
+            _processor.CaseHotkeyShift = snapshot.Case.HotkeyShift;
             _processor.RefreshExclusions(); // чёрный список мог измениться - пересчитать для активного окна
         });
 

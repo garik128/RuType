@@ -57,6 +57,35 @@ public sealed class Analyzer
     {
         if (string.IsNullOrEmpty(word)) return Decision.None;
 
+        // "ДВе заглавные" ('ДВе', 'GHbdtn'): дальше анализируем уже нормализованное
+        // слово - так и перекладка раскладки получает 'Ghbdtn' -> 'Привет' (а 'GHbdtn'
+        // защищался бы как camelCase-бренд). Если больше ничего не нашлось, правкой
+        // считается сама смена регистра - при условии, что это словарное слово.
+        string? twoCaps = _cfg.Case.FixTwoCapitals ? CaseHelper.FixTwoCapitals(word) : null;
+        if (twoCaps == null) return AnalyzeCore(word);
+
+        string lower = word.ToLowerInvariant();
+        if (_dict.IsStopWord(lower)) return Decision.None;
+
+        // Две заглавные задуманы, если хвост со второй буквы - сам слово: 'ВКонтакте'
+        // (контакте), 'IPhone' (phone). У опечатки хвост - обрубок ('ривет', 'егодня').
+        // От 4 букв: короткий хвост слишком часто случайно словарный ('СТол' -> 'тол').
+        string tail = lower[1..];
+        bool tailIsWord = tail.Length >= 4
+            && (LayoutMap.IsAllCyrillic(word) ? _dict.IsValidRu(tail) : _dict.IsValidEn(tail));
+        if (tailIsWord) return AnalyzeCore(word);
+
+        Decision d = AnalyzeCore(twoCaps);
+        if (d.Kind != ActionKind.None) return d;
+        if (_dict.TryRule(lower, out _)) return Decision.None;  // правило совпало с регистром - не наше дело
+        bool valid = LayoutMap.IsAllCyrillic(word)
+            ? _dict.IsValidRu(lower)
+            : _dict.IsValidEn(lower) && !_dict.IsEnExtra(lower);  // MHz, OAuth - канон регистра
+        return valid ? new Decision(ActionKind.Typo, twoCaps) : Decision.None;
+    }
+
+    private Decision AnalyzeCore(string word)
+    {
         string lower = word.ToLowerInvariant();
 
         // 2. Стоп-слова - руки прочь.
@@ -96,6 +125,7 @@ public sealed class Analyzer
         if (!_cfg.Typo.Enabled) return Decision.None;
         if (word.Length < _cfg.Typo.MinWordLength) return Decision.None;
         if (!IsPureCyrillic(word)) return Decision.None;        // только русские слова
+        if (HasInnerCapital(word)) return Decision.None;        // 'ВКонтакте', 'МойОфис' - имя, не опечатка
 
         if (_dict.IsValidRu(word)) return Decision.None;        // морфология: слово существует
 
@@ -220,6 +250,20 @@ public sealed class Analyzer
         => (c >= 'а' && c <= 'я') || (c >= 'А' && c <= 'Я') || c == 'ё' || c == 'Ё';
 
     private static bool IsLatCh(char c) => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+
+    // Заглавная не в начале при наличии строчных (слово не целиком прописное): так
+    // пишут бренды и названия, у них Hunspell предлагал бы "поправить" на обычное
+    // слово ('ВКонтакте' -> 'Контакте').
+    private static bool HasInnerCapital(string s)
+    {
+        bool inner = false, lower = false;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (char.IsLower(s[i])) lower = true;
+            else if (i > 0 && char.IsUpper(s[i])) inner = true;
+        }
+        return inner && lower;
+    }
 
     private static bool IsPureCyrillic(string s)
     {

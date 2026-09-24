@@ -41,6 +41,12 @@ public sealed class InputProcessor
     /// <summary>VK хоткея вызова окна слова (настраивается). По умолчанию ScrollLock. 0 - выкл.</summary>
     public int SuggestHotkeyVk { get; set; } = 0x91;
 
+    /// <summary>VK хоткея смены регистра последнего слова (0 - выкл) и нужен ли Shift.
+    /// По умолчанию Shift+Pause: проверяется раньше хоткея отката, поэтому Pause без
+    /// Shift остаётся откатом/сменой раскладки.</summary>
+    public int CaseHotkeyVk { get; set; } = 0x13;
+    public bool CaseHotkeyShift { get; set; } = true;
+
     private readonly WordBuffer _buffer = new();
     private readonly Analyzer _analyzer;
     private readonly Dispatcher? _dispatcher;
@@ -83,6 +89,13 @@ public sealed class InputProcessor
     // (',' -> 'б'), которые буквенный буфер теряет: ',fylbn' -> 'бандит'.
     private readonly List<SegKey> _forceSegment = new();
     private IntPtr _forceSegHkl = IntPtr.Zero;
+
+    // Последнее завершённое слово, КАК ОНО НА ЭКРАНЕ (после правки - исправленное), и
+    // разделители после него - для смены регистра хоткеем. Разделители копятся, как у
+    // force ("слово, "); сбрасывается в начале нового слова и при уходе каретки.
+    private string? _caseWord;
+    private string _caseSep = string.Empty;
+    private int _caseSepVk;
 
     // Последнее завершённое слово (исходная форма) - для ручного вызова окна слова.
     private string? _lastWord;
@@ -171,6 +184,7 @@ public sealed class InputProcessor
         _buffer.Reset();
         ResetSegment();
         ResetForce();
+        ResetCase();
         _toggleAvailable = false;
         _recentCorrectedOriginal = null;
     }
@@ -229,6 +243,18 @@ public sealed class InputProcessor
             return;
         }
 
+        // Хоткей регистра (Shift+Pause) - раньше отката: у них одна клавиша по умолчанию.
+        if (CaseHotkeyVk != 0 && e.VkCode == (uint)CaseHotkeyVk && Modifiers().Shift == CaseHotkeyShift)
+        {
+            if (SkipPasswordFields && _exclusions != null && _exclusions.IsPasswordThorough())
+            {
+                ResetWordState();
+                return;
+            }
+            if (TryChangeCase()) e.Suppress = true;
+            return;
+        }
+
         // Хоткей Pause (контекстно): если по слову была автоправка - переключаем её;
         // иначе перебиваем раскладку сырого сегмента (буквы+знаки), затем - запасной
         // вариант по последнему завершённому слову. В поле пароля - ничего: перекладка
@@ -256,6 +282,7 @@ public sealed class InputProcessor
         if (SkipPasswordFields && _exclusions != null && _exclusions.IsPasswordFast())
         {
             ResetTyping();
+            ResetCase();
             if (e.VkCode == VK_TAB || e.VkCode == VK_RETURN) _exclusions.InvalidateFocusCache(); // фокус уходит
             return;
         }
@@ -266,10 +293,11 @@ public sealed class InputProcessor
         // словом в буфере срабатывал как граница: правка улетала в чужое окно, а сам
         // Alt+Tab глушился подавлением клавиши. Ctrl+Tab, Alt+Tab и подобные уводят
         // фокус - кешированный ответ "не пароль" больше не действителен.
-        if (CommandChordHeld()) { ResetTyping(); ResetForce(); _exclusions?.InvalidateFocusCache(); return; }
+        if (CommandChordHeld()) { ResetTyping(); ResetForce(); ResetCase(); _exclusions?.InvalidateFocusCache(); return; }
 
         if (e.VkCode == VK_BACK)
         {
+            if (_buffer.IsEmpty) ResetCase(); // стирают хвост завершённого слова
             _buffer.Backspace();
             _deletesSinceCorrection++;
             if (_segment.Count > 0) _segment.RemoveAt(_segment.Count - 1);
@@ -289,13 +317,14 @@ public sealed class InputProcessor
             // Стрелки, Home/End, Delete, F-клавиши: каретка ушла - набор устарел.
             ResetTyping();
             ResetForce();
+            ResetCase();
             return;
         }
 
         if (ch.Length == 1 && char.IsLetterOrDigit(ch[0]))
         {
             // Первый символ нового слова - прежний force (по завершённому слову) устарел.
-            if (_buffer.IsEmpty) ResetForce();
+            if (_buffer.IsEmpty) { ResetForce(); ResetCase(); }
             _buffer.Append(ch);
             RecordSeg(e.VkCode, e.ScanCode);
             return;
@@ -343,6 +372,7 @@ public sealed class InputProcessor
                 Log.Line("boundary: поле пароля (UIA) - пропуск");
                 ResetSegment();
                 ResetForce();
+                ResetCase();
                 return;
             }
         }
@@ -429,6 +459,13 @@ public sealed class InputProcessor
             // Это и чинит отказ хоткея после "слово, " / "слово  " / "слово5 ".
             if (_forceAvailable && _forceSep != null && (isSpace || isPunct) && _forceSep.Length < 32)
                 _forceSep += sepText;
+            if (_caseWord != null)
+            {
+                // Хвост после Enter/Tab одной строкой уже не повторить - регистр этого
+                // слова больше не трогаем.
+                if ((isSpace || isPunct) && _caseSepVk == 0 && _caseSep.Length < 32) _caseSep += sepText;
+                else ResetCase();
+            }
             return;
         }
         _lastWord = word; // запомнить для ручного вызова окна слова
@@ -462,6 +499,20 @@ public sealed class InputProcessor
         if (decision.Kind == ActionKind.Rule && isPunct && word.Length == 1)
         {
             Log.Line($"rule '{word}' на знаке-границе подавлено (однобуквенное)");
+            decision = Decision.None;
+        }
+
+        // Правило-перекладка (ключ в текущей раскладке, результат - буквы противоположной)
+        // на границе-знаке-букве не применяем по той же причине, что и layout-решение ниже:
+        // человек печатает в чужой раскладке, и знак - буква, продолжающая слово.
+        // 'избранное' на EN = 'bp,hfyyjt', правило 'bp=из' срабатывало на ',' и давало
+        // 'из,hfyyjt'. Целое слово чинит сырой прогон на пробеле/Enter; там же правило
+        // сработает, если ключ набран целиком ('bp '). Правила в той же письменности
+        // ('thx=thanks' перед ',') не трогаем - там знак задуман знаком.
+        if (decision.Kind == ActionKind.Rule && isPunct && IsLetterKeyInOppositeLayout(e, layout)
+            && IsOppositeScript(decision.Replacement, layout))
+        {
+            Log.Line($"rule '{word}' на знаке-букве подавлено (целое слово чинит сырой прогон)");
             decision = Decision.None;
         }
 
@@ -503,6 +554,7 @@ public sealed class InputProcessor
         {
             // Правки не было - слово доступно для ручного принудительного переключения раскладки.
             ArmForce(word, sepText, sepVk, segSnapshot, segSnapshotHkl);
+            ArmCase(word, sepText, sepVk);
             return;
         }
 
@@ -531,6 +583,7 @@ public sealed class InputProcessor
         _recentCorrectedOriginal = original;
         _recentCorrectedLen = decision.Replacement.Length;
         _deletesSinceCorrection = 0;
+        ArmCase(decision.Replacement, sepText, sepVk);
 
         Post(() => ReplacementRequested?.Invoke(req));
     }
@@ -572,6 +625,7 @@ public sealed class InputProcessor
 
         t.ShowingCorrected = !t.ShowingCorrected;
         _recentCorrectedOriginal = null;
+        ArmCase(t.ShowingCorrected ? t.Corrected : t.Original, t.Separator, t.SepVk);
         Log.Line($"toggle -> {(t.ShowingCorrected ? "исправленное" : "исходное")} '{req.Text}'");
 
         Post(() => ToggleRequested?.Invoke(req));
@@ -645,6 +699,7 @@ public sealed class InputProcessor
 
                 LayoutTarget lt = SameLang(target, RuLayout) ? LayoutTarget.Ru : LayoutTarget.En;
                 _forceSegHkl = target; // перезарядка: повторный Pause перебьёт обратно
+                if (_caseWord != null) _caseWord = tgtStr;
                 EmitForce(curStr.Length + footprint, tgtStr + sep, lt, _forceSepVk);
                 return true;
             }
@@ -652,6 +707,7 @@ public sealed class InputProcessor
             string w = _forceWord;
             if (!TryRemap(w, out string remapped, out LayoutTarget target2)) return false;
             _forceWord = remapped; // перезарядка: повторный Pause перебьёт обратно
+            if (_caseWord != null) _caseWord = remapped;
             EmitForce(w.Length + footprint, remapped + sep, target2, _forceSepVk);
             return true;
         }
@@ -701,6 +757,58 @@ public sealed class InputProcessor
         _forceSegHkl = IntPtr.Zero;
     }
 
+    private void ArmCase(string screenWord, string sep, int sepVk)
+    {
+        _caseWord = screenWord;
+        _caseSep = sep;
+        _caseSepVk = sepVk;
+    }
+
+    private void ResetCase()
+    {
+        _caseWord = null;
+        _caseSep = string.Empty;
+        _caseSepVk = 0;
+    }
+
+    /// <summary>
+    /// Смена регистра по хоткею: набираемое слово (буфер) или последнее завершённое с его
+    /// разделителями. По кругу: строчные -> ПРОПИСНЫЕ -> Первая прописная -> строчные.
+    /// Откат и force после этого недоступны - их состояние описывает прежний текст.
+    /// </summary>
+    private bool TryChangeCase()
+    {
+        if (!_buffer.IsEmpty)
+        {
+            string w = _buffer.Current;
+            string? next = CaseHelper.NextCase(w);
+            if (next == null) return false;
+            _buffer.Reset();
+            _buffer.Append(next);
+            DropAfterCaseChange();
+            EmitForce(w.Length, next, LayoutTarget.None, 0);
+            return true;
+        }
+
+        if (_caseWord == null) return false;
+        string? nw = CaseHelper.NextCase(_caseWord);
+        if (nw == null) return false;
+        int footprint = _caseSep.Length + (_caseSepVk != 0 ? 1 : 0);
+        int backspaces = _caseWord.Length + footprint;
+        _caseWord = nw;
+        DropAfterCaseChange();
+        EmitForce(backspaces, nw + _caseSep, LayoutTarget.None, _caseSepVk);
+        return true;
+    }
+
+    private void DropAfterCaseChange()
+    {
+        _toggleAvailable = false;
+        _recentCorrectedOriginal = null;
+        ResetForce();
+        ResetSegment();
+    }
+
     private bool TrySegmentRemap()
     {
         if (_segment.Count == 0 || RuLayout == IntPtr.Zero || EnLayout == IntPtr.Zero) return false;
@@ -740,6 +848,19 @@ public sealed class InputProcessor
         IntPtr opp = SameLang(current, RuLayout) ? EnLayout : RuLayout;
         string? s = TranslateWith(e.VkCode, e.ScanCode, opp, false, false);
         return s is { Length: 1 } && char.IsLetter(s[0]);
+    }
+
+    // Текст содержит буквы письменности противоположной раскладки (для EN - кириллицу).
+    private bool IsOppositeScript(string text, IntPtr current)
+    {
+        bool oppIsRu = !SameLang(current, RuLayout);
+        foreach (char c in text)
+        {
+            if (!char.IsLetter(c)) continue;
+            bool cyr = (c >= 'Ѐ' && c <= 'ӿ');
+            if (cyr == oppIsRu) return true;
+        }
+        return false;
     }
 
     /// <summary>
